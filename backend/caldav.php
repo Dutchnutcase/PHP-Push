@@ -1,7 +1,7 @@
 <?php
 
-include_once('diffbackend.php');
-require_once('class_webdav_client.php');
+require_once('diffbackend.php');
+require_once('class_caldav_client.php');
 require_once('class_ical_client.php');
 
 class BackendCalDav extends BackendDiff {
@@ -9,24 +9,16 @@ class BackendCalDav extends BackendDiff {
     var $_devid;
     var $_protocolversion;
     var $_path;
-    var $_dir;
+    var $_events = array();
+    var $_tasks = array();
+    var $_currentTimezone = null;
 
     function BackendCalDAV($config) {
         $this->_config = $config;
     }
     
     function Logon($username, $domain, $password) {
-        debugLog('CalDAV::logon to webdav server');
-        $this->wdc = new webdav_client();
-        $this->wdc->set_server($this->_config['CALDAV_SERVER']);
-        $this->wdc->set_port($this->_config['CALDAV_PORT']);
-        $this->wdc->set_user($username);
-        $this->wdc->set_pass($password);
-
-        // use HTTP/1.1
-        $this->wdc->set_protocol(1);
-        // enable debugging
-        $this->wdc->set_debug(false);
+        debugLog('CalDAV::logon to CalDav server');
 
         # Replace variables in config
         foreach ($this->_config as $key => $value)
@@ -36,29 +28,14 @@ class BackendCalDav extends BackendDiff {
             $this->_config[$key] = str_replace("%u", $username, $this->_config[$key]);
             debugLog("CalDAV::Config: Updated $key with " .$this->_config[$key]);
         }
-                                                    
-        if (!$this->wdc->open()) {
-            debugLog('CalDAV::could not open server connection');
-            return false;
-        }
-        
-        // check if server supports webdav rfc 2518
-        if (!$this->wdc->check_webdav($this->_config['CALDAV_PATH'])) {
-            debugLog('CalDAV::server does not support webdav or user/password may be wrong');
-            return false;
-        }   
-        $this->_path = $this->_config['CALDAV_PATH'];
-
-        debugLog('CalDAV::Successful Logon To WebDAV Server');
+        $this->cdc = new CalDAVClient($this->_config['CALDAV_SERVER'] . $this->_config['CALDAV_PATH'], $username, $password, "calendar" );                                            
+        debugLog('CalDAV::Successful Logon To CalDAV Server');
         return true;
     }
 
     // completing protocol
     function Logoff() {
         debugLog('CalDAV::Closing Connection');
-        if ($this->wdc) {
-            $this->wdc->close();
-        }
         return true;
     }
 
@@ -73,7 +50,7 @@ class BackendCalDav extends BackendDiff {
         return false;
     }
 
-    function GetWasteBasket() {
+    function GetWasteBasket($class) {
         return false;
     }
     
@@ -93,23 +70,39 @@ class BackendCalDav extends BackendDiff {
             return false;
 
         $messages = array();
+    
+        /* Calculating the range of events we want to sync */
+        $begin = date("Ymd\THis\Z", $cutoffdate);
+        $diff = time() - $cutoffdate;
+        $finish = date("Ymd\THis\Z", 2147483647);
 
-        $this->_dir = $this->wdc->ls($this->_config['CALDAV_PATH']);
-        if (!$this->_dir)
-		return false;
-
-	foreach($this->_dir as $e) {
-		$this->_path = $this->wdc->_translate_uri($this->_config['CALDAV_PATH']);
-		$e['href'] = substr($e['href'], strlen($this->_path));
-			
-		if (trim($e['href']) != "") {
-			$message = $this->StatMessage($folderid, $e['href']);
-			if ($message) {
-				$messages[] = $message;
-			}
-		}
-	}
-	return $messages;
+        if ($folderid == "calendar")
+        {
+            $events = $this->cdc->GetEvents($begin, $finish);
+            debugLog("CalDAV::GetMessageList: Got " . count($events) . " events (" . $begin . " to " . $finish . ")");
+            foreach ($events as $e)
+            {
+                $id = $e['href'];
+                $this->_events[$id] = $e;
+                $message = $this->StatMessage($folderid, $id);
+            }
+            return $this->_events;
+        }
+        if ($folderid == "tasks")
+        {
+            $tasks = $this->cdc->GetTodos($begin, $finish);
+            debugLog("CalDAV::GetMessageList: Got " . count($tasks) . " tasks (" . $begin . " to " . $finish . ")");
+            foreach ($tasks as $e)
+            {
+                $id = $e['href'];
+                $this->_tasks[$id] = $e;
+                $message = $this->StatMessage($folderid, $id);
+            }
+            return $this->_tasks;
+        }
+        
+        if (!$this->_tasks || !$this->_events)
+            return false;
     }
 
     function GetFolderList() {
@@ -160,135 +153,155 @@ class BackendCalDav extends BackendDiff {
         return false;
     }
 
-    function StatMessage($folderid, $id) {
-        
+    function StatMessage($folderid, $id) {       
+ 
         if ($folderid != "calendar" && $folderid != "tasks") {
             return false;
         }
-
         if (trim($id == "")) {
             return false;
         }
-        
-        if (!$this->_dir) {
-            $this->_dir = $this->wdc->ls($this->_path);
+
+        debugLog("CalDAV::StatMessage($folderid: $id)");    
+ 
+        $e = null;
+        if ($folderid == "calendar")
+        {
+            if (array_key_exists($id, $this->_events))
+                $e = $this->_events[$id];
         }
-        if (!$this->_dir) {
-            return false;
+        if ($folderid == "tasks")
+        {
+            if (array_key_exists($id, $this->_tasks))
+                $e = $this->_tasks[$id];
+        }
+        if ($e == null)
+        {
+            $e = $this->cdc->GetEntryByUid(substr($id, 0, strlen($id)-4));
+            if ($e == null && count($e) <= 0)
+                return;
+            $e = $e[0];
         }
 
-        foreach($this->_dir as $e) {
-            $e['href'] = substr($e['href'], strlen($this->_path));
-            if ($e['href'] == $id) {
-                $event = $this->isevent($this->_path.$e['href']);
-                if ($event && $folderid == "calendar") {
-                	debugLog('CalDAV::StatMessage('.$folderid.', '.$id.') is '.$event);
-                    $message = array();
-                    $message["id"] = $e['href'];
-                    if (array_key_exists('lastmodified', $e)) {
-                        $message["mod"] = $e['lastmodified'];
-                        debugLog('CalDAV::message moded at '.$e['lastmodified']);
-                    } else {
-                    	$message["mod"] = date("d.m.Y H:i:s");
-                    }
-                    $message["flags"] = 1; // always 'read'
-                    return $message;
-                }
-                if (!$event && $folderid == "tasks") {
-                	debugLog('CalDAV::StatMessage('.$folderid.', '.$id.') is '.$event);
-                    $message = array();
-                    $message["id"] = $e['href'];
-                    if (array_key_exists('lastmodified', $e)) {
-                        $message["mod"] = $e['lastmodified'];
-                        debugLog('CalDAV::message moded at '.$e['lastmodified']);
-                    } else {
-                        $message["mod"] = date("d.m.Y H:i:s");
-                    }
-                    $message["flags"] = 1; // always 'read'
-                    return $message;
-                }
-            }
+        $event = $this->isevent($e['data']);
+        if ($event && $folderid == "calendar") {
+            debugLog('CalDAV::StatMessage('.$folderid.', '.$id.') is '.$event);
+            $message = $e;
+            $message["id"] = $e['href'];
+            $message["mod"] = $this->getLastModified($e['data'], $event);
+            debugLog('CalDAV::message moded at '. $message["mod"]);
+            $message["flags"] = 1; // always 'read'
+            $this->_events[$id] = $message;
+            return $message;
+        }
+        if (!$event && $folderid == "tasks") {
+            debugLog('CalDAV::StatMessage('.$folderid.', '.$id.') is '.$event);
+            $message = $e;
+            $message["id"] = $e['href'];
+            $message["mod"] = $this->getLastModified($e['data'], $event);
+            debugLog('CalDAV::message moded at '. $message["mod"]);
+            $message["flags"] = 1; // always 'read'
+            $this->_tasks[$id] = $message;
+            return $message;
         }
         return false;
     }
 
-    function isevent($href) {
-        $stat = $this->wdc->get($href, $output); 
-        if ($stat == 200) { 
-            $rows = explode("\n", $output);
-            $v = new vcalendar();
-            $v->runparse($rows);
-            $v->sort();
+    function isevent($data) {
+        $v = new vcalendar();
+        $v->parse($data);
             
-            if ($vevent = $v->getComponent('vevent')) {
-                return true;
-            } else {
-                return false;
+        if ($vevent = $v->getComponent('vevent')) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+    
+    function getLastModified($data, $event)
+    {
+        $v = new vcalendar();
+        $v->parse($data);
+        if ($event) {
+            while ($vevent = $v->getComponent('vevent')) {
+                $m = $vevent->getProperty('LAST-MODIFIED');
+                if ($m)
+                    return gmdate("Ymd\THis\Z", gmmktime($m['hour'], $m['min'], $m['sec'], $m['month'], $m['day'], $m['year']));
             }
         }
-        return false;
+        else {
+            while ($vtodo = $v->getComponent('vtodo')) {
+                $m = $vtodo->getProperty('LAST-MODIFIED');
+                if ($m)
+                    return gmdate("Ymd\THis\Z", gmmktime($m['hour'], $m['min'], $m['sec'], $m['month'], $m['day'], $m['year']));
+            }
+        }
+        return gmdate("Ymd\THis\Z");
     }
 
     function GetMessage($folderid, $id, $truncsize, $mimesupport = 0) {
 
         debugLog('CalDAV::GetMessage('.$folderid.', '.$id.', ..)');
-        
-        if ($folderid != "calendar" && $folderid != "tasks") {
-            return;
-        }
-        if (trim($id == "")) {
-            return;
-        }
-        
-        debugLog("CalDAV::Getting ".$this->_path.$id);
-        $stat = $this->wdc->get($this->_path.$id, $output); 
-        if ($stat == 200) {
-            //debugLog("CalDAV::Got File ".$id." now parseing ".$output);
-            $rows = explode("\n", $output);
-            $v = new vcalendar();
-            $v->runparse($rows);
-            $v->sort();
-                        
-        	if ($folderid == "tasks") {
-                while ($vtodo = $v->getComponent('vtodo', $vcounter)) {
-                    $message = $this->converttotask($vtodo, $truncsize);
-                    $vcounter++;
-            	}
-            } else {
-                $vcounter = 1;
-                $fullexceptionsarray = array();
-                while ($vevent = $v->getComponent( 'vevent', $vcounter)) {
-                    $val = $vevent->getProperty("RECURRENCE-ID");
-                    if ($val === false) {
-                        $message = $this->converttoappointment($vevent, $truncsize);
-                    } else {
-                        $tmp = $this->converttoappointment($vevent, $truncsize);
-                        $tmp->deleted = "0";
-                        $tmp->exceptionstarttime = $tmp->starttime;
-                        unset($tmp->uid);
-                        unset($tmp->exceptions);
-                        array_push($fullexceptionsarray, $tmp);
-                        unset($tmp);
-                    }
-                    $vcounter++;
-                }
-                $message->exceptions = array_merge($message->exceptions, $fullexceptionsarray);
-            }
 
-            if ($vtimezone = $v->getComponent( 'vtimezone' )) { 
-                $message = $this->setoutlooktimezone($message, $vtimezone);
-            }           
-            debugLog("CalDAV::Finsihed Converting ".$id." now returning");
-            return $message;
-        } else {
-            debugLog('CalDAV::Could not retrieve file from server');
+        if (trim($id) == "")
             return;
-        }   
+ 
+        if ($folderid == "calendar")
+            $output = $this->_events[$id]['data'];
+        elseif ($folderid == "tasks")
+            $output = $this->_tasks[$id]['data'];
+        else
+            return;     
+        
+        //debugLog("CalDAV::Got File ".$id." now parseing ".$output);
+        $v = new vcalendar();
+        $v->parse($output);
+        $v->sort();
+        
+        if ($vtimezone = $v->getComponent( 'vtimezone' )) {
+            $this->_currentTimezone = $vtimezone->getProperty('tzid');
+        }
+
+        $vcounter = 1;
+        if ($folderid == "tasks") {
+            while ($vtodo = $v->getComponent('vtodo', $vcounter)) {
+                $message = $this->converttotask($vtodo, $truncsize);
+                $vcounter++;
+            }
+        } else {
+            $fullexceptionsarray = array();
+            while ($vevent = $v->getComponent( 'vevent', $vcounter)) {
+                $val = $vevent->getProperty("RECURRENCE-ID");
+                if ($val === false) {
+                    $message = $this->converttoappointment($vevent, $truncsize);
+                } else {
+                    $tmp = $this->converttoappointment($vevent, $truncsize);
+                    $tmp->deleted = "0";
+                    //The exceptionstarttime is the ORIGINAL starttime of the event
+                    //On Thunderbird this is equal to the RECCURENCE-ID (which is in $val)
+                    $tmp->exceptionstarttime = $this->makeGMTTime($val);
+                    unset($tmp->uid);
+                    unset($tmp->exceptions);
+                    array_push($fullexceptionsarray, $tmp);
+                    unset($tmp);
+                }
+                $vcounter++;
+            }
+            $message->exceptions = array_merge($message->exceptions, $fullexceptionsarray);
+        }
+
+        if ($vtimezone = $v->getComponent( 'vtimezone' )) { 
+            $message = $this->setoutlooktimezone($message, $vtimezone);
+        }           
+        debugLog("CalDAV::Finsihed Converting ".$id." now returning");
+        return $message;
     }
 
     function DeleteMessage($folderid, $id) {
-        $http_status_array = $this->wdc->delete($this->_path.'/'.$id);
-        if ($http_status_array['status'] == "200") {
+        debugLog("CalDAV::DeleteMessage(" . $folderid . ", " . $id.", ..)");
+        $http_status_code = $this->cdc->DoDELETERequest($id);
+        debugLog("CalDAV::DeleteMessage Reply: $http_status_code");
+        if ($http_status_code == "204") {
             return true;
         } else {
             return false;
@@ -350,8 +363,7 @@ class BackendCalDav extends BackendDiff {
                         } else {
                             $tmpevent->setProperty("recurrence-id",  $this->parseDate($ex->exceptionstarttime));
                         }
-                        array_push($exarray, $tmpevent);
-                        
+                        array_push($exarray, $tmpevent);            
                     }
                 }
                 debugLog("CalDAV:: ".print_r($deletedarray ,true));
@@ -366,14 +378,18 @@ class BackendCalDav extends BackendDiff {
             }
         }
         
+        // Set mod date to current
+        $mod = $this->parseGMTDate(time());
+
         #   $somethingelse = convert2ical();
         debugLog('CalDAV::Converted to iCal: ');    
         $v = new vcalendar();
         
-
         if ($folderid == "tasks") {
+            $vtodo->setProperty("LAST-MODIFIED", $mod);
             $v->setComponent( $vtodo );
         } else {
+            $vevent->setProperty("LAST-MODIFIED", $mod);
             $v->setComponent( $vevent );
             if (count($exarray) > 0) {
                 foreach($exarray as $exvevent) {
@@ -391,12 +407,25 @@ class BackendCalDav extends BackendDiff {
         }
         
         $output = $v->createCalendar();
-
         debugLog("CalDAV::putting to ".$this->_path.$id);   
 
-        $retput = $this->wdc->put($this->_path.$id, $output);
+        $etag = "*";
+        if ($return)
+            $etag = $return['etag'];
 
-        debugLog("CalDAV::output putted $retput");  
+        $retput = $this->cdc->DoPUTRequest($this->_path.$id, $output, $etag);
+        debugLog("CalDAV::output putted etag: $etag new etag: $retput");
+
+        $obj = array();
+        $obj["mod"] = $mod;
+        $obj["etag"] = $retput;
+        $obj["href"] = $id;
+        $obj["data"] = $output;
+
+        if ($folderid == "calendar")
+            $this->_events[$id] = $obj;
+        else
+            $this->_tasks[$id] = $obj;
 
         return $this->StatMessage($folderid, $id);
     }
@@ -405,8 +434,20 @@ class BackendCalDav extends BackendDiff {
         return false;
     }
 
+    /* At this moment we DO NOT support AlterPing
+     * But because Ping does not have a cutoffdate,
+     * we get into issues. So we just "fake" AlterPing
+     */
+    function AlterPing() {
+        return true;
+    }
+
+    function AlterPingChanges($folderid, &$syncstate) {
+        return array();
+    }
+
     function setoutlooktimezone($message, $vtimezone) {
-        //$message->timezone = $vtimezone->getProperty('tzid');
+        $message->timezone = $this->getTimezoneString($this->_currentTimezone);
         return $message;
     }
     
@@ -427,7 +468,7 @@ class BackendCalDav extends BackendDiff {
         $message = $this->converttooutlook($message, $vevent, $truncsize, $mapping);
 
         if (($message->endtime-$message->starttime) >= 24*60*60) {
-            debugLog("CalDAV:: sdt edt diff ".($message->endtime-$message->starttime));
+            debugLog("CalDAV:: sdt edt diff : Endtime: " . $message->endtime . " Startime: " . $message->starttime);
             $message->alldayevent = "1";
         }
 
@@ -475,6 +516,7 @@ class BackendCalDav extends BackendDiff {
             "class" => array("sensitivity", 1),
             "description" => array("body", 2),
             "completed" => array("datecompleted", 11),
+            "status" => array("complete", 1),
             "due" => array("duedate", 11),
             "dtstart" => array("startdate", 11),
             "summary" => array("subject", 9),
@@ -549,6 +591,17 @@ class BackendCalDav extends BackendDiff {
                                     $val = 2;
                             }    
                         break;
+                        case "complete":
+                            switch ($val) {
+                                case "NEEDS-ACTION":
+                                case "IN-PROCESS":
+                                case "CANCELLED":
+                                    $val = "0";
+                                    break;
+                                case "COMPLETED":
+                                default:
+                                    $val = "1";
+                            }
                     } 
                 }
                 if ($e[1] == 2) {
@@ -561,14 +614,10 @@ class BackendCalDav extends BackendDiff {
                 if ($e[1] == 3) {
                     // convert to date
                     if (is_array($val)) {
-                        if ( !empty($val['TZID'])) {
-                            //$message->timezone = $val['TZID'];
+                        if (!empty($val['TZID'])) {
+                            $message->timezone = $this->getTimezoneString($val['TZID']);
                         }
-                        if (array_key_exists('hour', $val) && array_key_exists('min', $val) && array_key_exists('sec', $val)) {
-                            $val = mktime($val['hour'], $val['min'], $val['sec'], $val['month'], $val['day'], $val['year']);
-                        } else {
-                            $val = mktime(0, 0, 0, $val['month'], $val['day'], $val['year']);
-                        }
+                        $val = $this->makeGMTTime($val);
                     } else {
                         $val =  $this->parseDateToOutlook($val);
                     }
@@ -618,18 +667,13 @@ class BackendCalDav extends BackendDiff {
                 }
                 if ($e[1] == 11) {
                     if (is_array($val)) {
-                        if ( !empty($val['TZID'])) {
-                            //$message->timezone = $val['TZID'];
+                        if (!empty($val['TZID'])) {
+                            $message->timezone = $this->getTimezoneString($val['TZID']);
                         }
-                        if (array_key_exists('hour', $val) && array_key_exists('min', $val) && array_key_exists('sec', $val)) {
-                            $val = mktime($val['hour'], $val['min'], $val['sec'], $val['month'], $val['day'], $val['year']);
-                        } else {
-                            $val = mktime(0, 0, 0, $val['month'], $val['day'], $val['year']);
-                        }
+                        $val = $this->makeGMTTime($val);
                     } else {
-                        $val =  $this->parseDateToOutlook($val);
+                        $val = $this->parseDateToOutlook($val);
                     }
-                    $message->complete = "1";               
                 }
                 if ($e[1] == 13) {
                     $tmpcounter = 1;
@@ -650,7 +694,12 @@ class BackendCalDav extends BackendDiff {
                 if (is_object($val)) {
                     $trigger = $val->getProperty("trigger");
                     if (is_array($trigger)) {
-                        $message->$e[0] = $trigger["min"];
+                        if ($trigger["min"]) {
+                            $message->$e[0] = $trigger["min"];
+                        }
+                        else {
+                            $message->$e[0] = "0";
+                        }
                     } else {
                         $message->$e[0] = "";                   
                     }
@@ -746,7 +795,10 @@ class BackendCalDav extends BackendDiff {
         }
     
         if (array_key_exists("COUNT", $args)) $rtn->occurrences = $args['COUNT'];
-        if (array_key_exists("INTERVAL", $args)) $rtn->interval = $args['INTERVAL'];        
+        if (array_key_exists("INTERVAL", $args))
+            $rtn->interval = $args['INTERVAL'];        
+        else
+            $rtn->interval = "1";
         if (array_key_exists("UNTIL", $args)) $rtn->until = gmmktime($args['UNTIL']['hour'], $args['UNTIL']['min'], $args['UNTIL']['sec'], $args['UNTIL']['month'], $args['UNTIL']['day'], $args['UNTIL']['year']);
         
         return $rtn;
@@ -773,7 +825,11 @@ class BackendCalDav extends BackendDiff {
         $ts = $ts + ($extradays*24*60*60);
         return date('Ymd\THis', $ts);
     }
-    
+    function parseGMTDate($ts, $extradays = 0) {
+        $ts = $ts + ($extradays*24*60*60);
+        return gmdate('Ymd\THis\Z', $ts);
+    }
+ 
     function parseDateToOutlook($ts) {
         return strtotime($ts);
     }
@@ -812,6 +868,37 @@ class BackendCalDav extends BackendDiff {
         $timestamp= mktime($hours,$minutes,$seconds,$month,$day,$year);
         return $timestamp;
     }
+   
+    function makeGMTTime($val)
+    {
+        $tz = timezone_open('GMT');
+        if (!empty($val['TZID'])) {
+            $tz = timezone_open($val['TZID']);
+        }
+        elseif ($this->_currentTimezone)
+        {
+            $tz = timezone_open($this->_currentTimezone);
+        }
+        $timestr = null;
+        $date = null;
+        if (array_key_exists('hour', $val) && array_key_exists('min', $val) && array_key_exists('sec', $val)) {
+            $timestr = sprintf("%d-%d-%d %d:%d:%d", $val['year'], $val['month'], $val['day'], $val['hour'], $val['min'], $val['sec']);
+            $date = date_create_from_format('Y-m-d H:i:s', $timestr, $tz);
+        }
+        else {
+            $timestr = sprintf("%d-%d-%d", $val['year'], $val['month'], $val['day']);
+            $date = date_create_from_format('Y-m-d', $timestr, $tz);
+        }
+        return date_timestamp_get($date);
+    }
+
+    /* TODO: Implement this better, now it always returns CET time or UTC time */
+    function getTimezoneString($timezone)
+    {
+        if ($timezone == "UTC")
+            return base64_encode(pack('la64vvvvvvvvla64vvvvvvvvl', 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 0));
+        return $this->_timezone = base64_encode(pack('la64vvvvvvvvla64vvvvvvvvl', -60, '', 0, 10, 0, 5, 3, 0, 0, 0, 0, '', 0, 3, 0, 5, 2, 0, 0, 0, -60));
+    }
     
     function converttovevent($message) {
     
@@ -819,12 +906,6 @@ class BackendCalDav extends BackendDiff {
         $vevent = new vevent();
         debugLog('CalDAV:: About to create mapping array.');
       
-        $mapping = array(
-            "dtstart" => array("starttime", 3),
-            "dtstamp" => array("dtstamp", 3),
-            "dtend" => array("endtime", 3)
-        );
-
         $allday = false;
         if (isset($message->alldayevent)) {
             $val = $message->alldayevent;
@@ -833,11 +914,13 @@ class BackendCalDav extends BackendDiff {
             }
         }
 
-        $vevent = $this->converttoical($vevent, $message, $mapping, $allday);
-
         $mapping = array(
+            "dtstart" => array("starttime", 3),
+            "dtstamp" => array("dtstamp", 3),
+            "dtend" => array("endtime", 3),
             "class" => array("sensitivity", 1),
             "description" => array("rtf", 10),
+            "description" => array("body", 2),
             "location" => array("location", 0),
             "organizer" => array("organizername", 4),
             "organizer" => array("organizeremail", 4),
@@ -864,9 +947,11 @@ class BackendCalDav extends BackendDiff {
         $mapping = array(
             "class" => array("sensitivity", 1),
             "description" => array("rtf", 10),
+            "description" => array("body", 2),
             "completed" => array("datecompleted", 6),
-            "due" => array("utcduedate", 3),
-            "dtstart" => array("utcstartdate", 3),
+            "status" => array("complete", 11),
+            "due" => array("duedate", 3),
+            "dtstart" => array("startdate", 3),
             "priority" => array("importance", 1),
             "summary" => array("subject", 0),
             "uid" => array("uid", 0),
@@ -963,7 +1048,7 @@ class BackendCalDav extends BackendDiff {
                     }
                     if ($e[1] == 3) {
                         // convert to date
-                        $val = $this->parseDate($val);
+                        $val = $this->parseGMTDate($val);
                         if ($allday) {
                             $icalcomponent->setProperty( $k, $val, array('VALUE'=>'DATE'));                     
                         } else {
@@ -1030,7 +1115,7 @@ class BackendCalDav extends BackendDiff {
 
                         $args['INTERVAL'] = 1;
                         if (isset($val->interval) && $val->interval != "") $args['INTERVAL'] = $val->interval;
-                        if (isset($val->until) && $val->until != "") $args['UNTIL'] = $this->parseDate($val->until, 1);
+                        if (isset($val->until) && $val->until != "") $args['UNTIL'] = $this->parseGMTDate($val->until);
                         if (isset($val->occurrences) && $val->occurrences != "") $args['COUNT'] = $val->occurrences;
 
                         $icalcomponent->setProperty( $k, $args);                        
@@ -1071,6 +1156,17 @@ class BackendCalDav extends BackendDiff {
                         $rtfparser->parse();
                         $icalcomponent->setProperty( $k, $rtfparser->out);
                     }
+                    if ($e[1] == 11) {
+                        debugLog("converttoical: completed is $val");
+                        if ($val == "1") {
+                            $icalcomponent->setProperty( "PERCENT_COMPLETE", 100);
+                            $icalcomponent->setProperty( "STATUS", "COMPLETED");
+                        }
+                        else {
+                            $icalcomponent->setProperty( "PERCENT_COMPLETE", 0);
+                            $icalcomponent->setProperty( "STATUS", "NEEDS-ACTION");
+                        }
+                    }
                 }
             }
         }
@@ -1081,11 +1177,7 @@ class BackendCalDav extends BackendDiff {
         $rtn = new SyncAppointment();
         $rtn->deleted = "1";
         if (is_array($val)) {
-            if (array_key_exists('hour', $val) && array_key_exists('min', $val) && array_key_exists('sec', $val)) {
-                $val = mktime($val['hour'], $val['min'], $val['sec'], $val['month'], $val['day'], $val['year']);
-            } else {
-                $val = mktime(0, 0, 0, $val['month'], $val['day'], $val['year']);                       
-            }
+            $val = $this->makeGMTTime($val);
         } else {
             $val =  $this->parseDateToOutlook($val);
         }
