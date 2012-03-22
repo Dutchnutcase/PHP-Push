@@ -885,16 +885,35 @@ class BackendCalDav extends BackendDiff {
         $date = null;
         if (array_key_exists('hour', $val) && array_key_exists('min', $val) && array_key_exists('sec', $val)) {
             $timestr = sprintf("%d-%d-%d %d:%d:%d", $val['year'], $val['month'], $val['day'], $val['hour'], $val['min'], $val['sec']);
-            $date = date_create_from_format('Y-m-d H:i:s', $timestr, $tz);
         }
         else {
-            $timestr = sprintf("%d-%d-%d %d:%d:%d UTC", $val['year'], $val['month'], $val['day'], 0, 0, 0);
-            $date = date_create_from_format('Y-m-d H:i:s T', $timestr, $tz);
+            $timestr = sprintf("%d-%d-%d %d:%d:%d", $val['year'], $val['month'], $val['day'], 0, 0, 0);
         }
+        $date = date_create_from_format('Y-m-d H:i:s', $timestr, $tz);
         return date_timestamp_get($date);
     }
 
-    function getTimezoneString($timezone)
+    // This returns a timezone that matches the timezonestring.
+    // We can't be sure this is the one you chose, as multiple timezones have same timezonestring
+    function getTimezoneFromString($tz_string)
+    {
+        //Get a list of all timezones
+        $identifiers = DateTimeZone::listIdentifiers();
+        //Try the default timezone first
+        array_unshift($identifiers, date_default_timezone_get());
+        foreach ($identifiers as $tz)
+        {
+            $str = $this->getTimezoneString($tz, false);
+            if ($str == $tz_string)
+            {
+                debugLog("getTimezoneFromString: timezone is " . $tz);
+                return $tz;
+            }
+        }
+        return date_default_timezone_get();
+    }
+
+    function getTimezoneString($timezone, $with_names = true)
     {
         // UTC needs special handling
         if ($timezone == "UTC")
@@ -906,6 +925,10 @@ class BackendCalDav extends BackendDiff {
             $trans = $timezone->getTransitions(time());
             $stdTime = null;
             $dstTime = null;
+            if (count($trans) < 3)
+            {
+                throw new Exception();
+            }
             if ($trans[1]['isdst'] == 1)
             {
                 $dstTime = $trans[1];
@@ -916,23 +939,47 @@ class BackendCalDav extends BackendDiff {
                 $dstTime = $trans[2];
                 $stdTime = $trans[1];
             }
-            $stdTime_array = date_parse($stdTime['time']);
+            $stdTimeO = new DateTime($stdTime['time']);
+            $stdFirst = new DateTime(sprintf("first sun of %s %s", $stdTimeO->format('F'), $stdTimeO->format('Y')));
+            $stdInterval = $stdTimeO->diff($stdFirst);
+            $stdDays = $stdInterval->format('%d');
             $stdBias = $stdTime['offset'] / -60;
             $stdName = $stdTime['abbr'];
             $stdYear = 0;
-            $stdMonth = $stdTime_array['month'];
-            $stdDay = $stdTime_array['day'];
-            $stdHour = $stdTime_array['hour'];
-            $stdMinute = $stdTime_array['minute'];
-            $dstTime_array = date_parse($dstTime['time']);
+            $stdMonth = $stdTimeO->format('n');
+            $stdWeek = floor($stdDays/7)+1;
+            $stdDay = $stdDays%7;
+            $stdHour = $stdTimeO->format('H');
+            $stdMinute = $stdTimeO->format('i');
+            $stdTimeO->add(new DateInterval('P7D'));
+            if ($stdTimeO->format('n') != $stdMonth)
+            {
+                $stdWeek = 5;
+            }
+            $dstTimeO = new DateTime($dstTime['time']);
+            $dstFirst = new DateTime(sprintf("first sun of %s %s", $dstTimeO->format('F'), $dstTimeO->format('Y')));
+            $dstInterval = $dstTimeO->diff($dstFirst);
+            $dstDays = $dstInterval->format('%d');
             $dstName = $dstTime['abbr'];
             $dstYear = 0;
-            $dstMonth = $dstTime_array['month'];
-            $dstDay = $dstTime_array['day'];
-            $dstHour = $dstTime_array['hour'];
-            $dstMinute = $dstTime_array['minute'];
+            $dstMonth = $dstTimeO->format('n');
+            $dstWeek = floor($dstDays/7)+1;
+            $dstDay = $dstDays%7;
+            $dstHour = $dstTimeO->format('H');
+            $dstMinute = $dstTimeO->format('i');
+            if ($dstTimeO->format('n') != $dstMonth)
+            {
+                $dstWeek = 5;
+            }
             $dstBias = ($dstTime['offset'] - $stdTime['offset']) / -60;
-            return base64_encode(pack('la64vvvvvvvvla64vvvvvvvvl', $stdBias, $stdName, 0, $stdMonth, $stdDay, 0, $stdHour, $stdMinute, 0, 0, 0, $dstName, 0, $dstMonth, $dstDay, 0, $dstHour, $dstMinute, 0, 0, $dstBias));
+            if ($with_names)
+            {
+                return base64_encode(pack('la64vvvvvvvvla64vvvvvvvvl', $stdBias, $stdName, 0, $stdMonth, $stdDay, $stdWeek, $stdHour, $stdMinute, 0, 0, 0, $dstName, 0, $dstMonth, $dstDay, $dstWeek, $dstHour, $dstMinute, 0, 0, $dstBias));
+            }
+            else
+            {
+                return base64_encode(pack('la64vvvvvvvvla64vvvvvvvvl', $stdBias, '', 0, $stdMonth, $stdDay, $stdWeek, $stdHour, $stdMinute, 0, 0, 0, '', 0, $dstMonth, $dstDay, $dstWeek, $dstHour, $dstMinute, 0, 0, $dstBias));
+            }
         }
         catch (Exception $e) {
             // If invalid timezone is given, we return UTC
@@ -947,6 +994,11 @@ class BackendCalDav extends BackendDiff {
         $vevent = new vevent();
         debugLog('CalDAV:: About to create mapping array.');
       
+        if (isset($message->timezone))
+        {
+            $this->_currentTimezone = $this->getTimezoneFromString($message->timezone);
+        }
+
         $allday = false;
         if (isset($message->alldayevent)) {
             $val = $message->alldayevent;
@@ -1089,10 +1141,14 @@ class BackendCalDav extends BackendDiff {
                     }
                     if ($e[1] == 3) {
                         // convert to date
-                        $val = $this->parseGMTDate($val);
                         if ($allday) {
+                            $date = date_create_from_format("U", $val);
+                            $tz = timezone_open ($this->_currentTimezone);
+                            date_timezone_set($date, $tz);
+                            $val = date_format($date, 'Ymd');
                             $icalcomponent->setProperty( $k, $val, array('VALUE'=>'DATE'));                     
                         } else {
+                            $val = $this->parseGMTDate($val);
                             $icalcomponent->setProperty( $k, $val);
                         }
                     }
